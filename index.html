@@ -274,19 +274,17 @@
     position:relative;
     background:#000000;
     transition:background-color .2s ease;
+    overflow:auto;
   }
   .canvasWrap{
     position:relative;
-    max-width:100%;
-    max-height:100%;
     display:flex;
     align-items:center;
     justify-content:center;
+    margin:auto;
   }
   #outputCanvas{
     display:block;
-    max-width:70vw;
-    max-height:78vh;
     image-rendering:auto;
   }
   #outputCanvas.hidden{ display:none; }
@@ -318,6 +316,40 @@
     opacity:0.5;
   }
 
+  .zoomBar{
+    position:fixed;
+    bottom:24px;
+    left:calc(50% + 170px);
+    transform:translateX(-50%);
+    display:flex;
+    align-items:center;
+    gap:12px;
+    background:rgba(10,10,10,0.9);
+    border:1px solid var(--line);
+    border-radius:24px;
+    padding:8px 18px;
+    backdrop-filter:blur(6px);
+    z-index:10;
+  }
+  .zoomBar.hidden{ display:none; }
+  .zoomBar button{
+    width:24px; height:24px;
+    padding:0;
+    border-radius:50%;
+    font-size:15px;
+    line-height:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .zoomBar input[type="range"]{ width:140px; }
+  .zoomBar span{
+    font-size:12px;
+    color:var(--ink-dim);
+    min-width:42px;
+    text-align:center;
+  }
+
   @media (max-width: 860px){
     body{ flex-direction:column; }
     .panel{
@@ -327,7 +359,7 @@
       border-right:none;
       border-bottom:1px solid var(--line);
     }
-    #outputCanvas{ max-width:90vw; }
+    .zoomBar{ left:50%; }
   }
 </style>
 </head>
@@ -435,13 +467,21 @@
     </div>
   </main>
 
+  <div class="zoomBar hidden" id="zoomBar">
+    <button type="button" id="zoomOut" aria-label="diminuir zoom">−</button>
+    <input type="range" id="zoomSlider" min="25" max="400" value="100" step="5">
+    <button type="button" id="zoomIn" aria-label="aumentar zoom">+</button>
+    <span id="zoomVal">100%</span>
+  </div>
+
 <script>
 (function(){
   "use strict";
 
   // ---------- constants ----------
-  var MAX_DIM = 640;      // processing resolution cap, keeps getImageData fast
-  var EXPORT_SCALE = 2;   // supersample factor for crisper PNG export
+  var MAX_DIM = 640;         // processing resolution cap, keeps getImageData fast
+  var SUPERSAMPLE = 2;       // internal pixel density, independent of zoom — keeps edges crisp
+  var FIT_TARGET_PX = 560;   // baseline on-screen size (css px) an image is scaled to at 100% zoom
 
   // ---------- dom ----------
   var fileInput   = document.getElementById('fileInput');
@@ -470,6 +510,11 @@
   var ctx         = canvas.getContext('2d');
   var emptyState  = document.getElementById('emptyState');
   var stage       = document.getElementById('stage');
+  var zoomBar     = document.getElementById('zoomBar');
+  var zoomSlider  = document.getElementById('zoomSlider');
+  var zoomVal     = document.getElementById('zoomVal');
+  var zoomOutBtn  = document.getElementById('zoomOut');
+  var zoomInBtn   = document.getElementById('zoomIn');
 
   // ---------- state ----------
   var srcImageData = null;   // ImageData of the (downscaled) source image
@@ -479,6 +524,7 @@
   var selectedColor = '#ffffff';
   var currentPadding = 0;   // safety margin so edge shapes never get clipped
   var canvasW = 0, canvasH = 0;
+  var baseFitRatio = 1;      // css px per content-pixel at 100% zoom, set once per upload
 
   // the exported result always stays transparent — this only decides
   // whether the on-screen preview sits on a black or white stage, so the
@@ -567,11 +613,19 @@
       return;
     }
 
+    // "100%" zoom is anchored to the source image size, not to canvasW/H
+    // (which also depends on shape padding) — so changing spacing or
+    // shape size later doesn't make the zoom baseline jump around
+    baseFitRatio = FIT_TARGET_PX / Math.max(offW, offH, 1);
+
     hasImage = true;
     downloadPngBtn.disabled = false;
     downloadSvgBtn.disabled = false;
     canvas.classList.remove('hidden');
     emptyState.style.display = 'none';
+    zoomBar.classList.remove('hidden');
+    zoomSlider.value = 100;
+    zoomVal.textContent = '100%';
     generateMosaic();
   }
 
@@ -689,19 +743,28 @@
     return lum < lumThreshold;
   }
 
+  // reads every control into one bundle — shared by the full regenerate
+  // path and the cheap redraw path (color/zoom changes), so both always
+  // agree on what "the current settings" means
+  function readParams(){
+    return {
+      type: shapeSelect.value,
+      spacingPx: parseFloat(spacing.value),
+      scalePct: parseFloat(shapeScale.value) / 100,
+      lumThreshold: parseFloat(threshold.value),
+      opts: {
+        starPoints: parseInt(starPoints.value, 10),
+        starSpike: parseFloat(starSpike.value),
+        ringThickness: parseFloat(ringThickness.value)
+      }
+    };
+  }
+
   function generateMosaic(){
     if (!hasImage) return;
 
-    var type = shapeSelect.value;
-    var spacingPx = parseFloat(spacing.value);
-    var scalePct = parseFloat(shapeScale.value) / 100;
-    var lumThreshold = parseFloat(threshold.value);
-    var opts = {
-      starPoints: parseInt(starPoints.value, 10),
-      starSpike: parseFloat(starSpike.value),
-      ringThickness: parseFloat(ringThickness.value)
-    };
-    var size = (spacingPx * scalePct) / 2;
+    var p = readParams();
+    var size = (p.spacingPx * p.scalePct) / 2;
 
     // shapes are drawn from a center point out to roughly `size` in every
     // direction, so grid cells right at the edge can overshoot the canvas
@@ -713,35 +776,42 @@
     canvasH = offH + padding * 2;
 
     var shapes = [];
-    var cols = Math.ceil(offW / spacingPx);
-    var rows = Math.ceil(offH / spacingPx);
+    var cols = Math.ceil(offW / p.spacingPx);
+    var rows = Math.ceil(offH / p.spacingPx);
 
     for (var row = 0; row < rows; row++){
-      var cy = row * spacingPx + spacingPx / 2;
+      var cy = row * p.spacingPx + p.spacingPx / 2;
       if (cy >= offH) continue;
       for (var col = 0; col < cols; col++){
-        var cx = col * spacingPx + spacingPx / 2;
+        var cx = col * p.spacingPx + p.spacingPx / 2;
         if (cx >= offW) continue;
-        if (isFilledPixel(cx, cy, lumThreshold)){
+        if (isFilledPixel(cx, cy, p.lumThreshold)){
           shapes.push([cx + padding, cy + padding]);
         }
       }
     }
 
     currentShapes = shapes;
-    renderCanvas(type, size, opts);
+    renderCanvas(p.type, size, p.opts);
     setStatus(shapes.length + ' formas geradas · ' + offW + '×' + offH + 'px');
   }
 
   function renderCanvas(type, size, opts){
-    canvas.width = canvasW * EXPORT_SCALE;
-    canvas.height = canvasH * EXPORT_SCALE;
-    canvas.style.width = canvasW + 'px';
-    canvas.style.height = canvasH + 'px';
+    // the preview's on-screen size is baseFitRatio × zoom; the pixel
+    // buffer is rendered SUPERSAMPLE× denser than that so edges stay
+    // crisp at any zoom level instead of blurring like a CSS-scaled image
+    var zoomFactor = parseFloat(zoomSlider.value) / 100;
+    var displayScale = baseFitRatio * zoomFactor;
+    var pixelScale = displayScale * SUPERSAMPLE;
+
+    canvas.width = canvasW * pixelScale;
+    canvas.height = canvasH * pixelScale;
+    canvas.style.width = (canvasW * displayScale) + 'px';
+    canvas.style.height = (canvasH * displayScale) + 'px';
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.scale(EXPORT_SCALE, EXPORT_SCALE);
+    ctx.scale(pixelScale, pixelScale);
 
     // canvas stays fully transparent — only the shapes are painted, so
     // the exported PNG/SVG has no background of its own
@@ -754,6 +824,15 @@
     }
   }
 
+  // cheap redraw: reuses the already-sampled shapes, just repaints them
+  // (used for color and zoom changes, which never alter the mosaic itself)
+  function redrawOnly(){
+    if (!hasImage) return;
+    var p = readParams();
+    var size = (p.spacingPx * p.scalePct) / 2;
+    renderCanvas(p.type, size, p.opts);
+  }
+
   function rerender(){
     if (!hasImage) return;
     generateMosaic();
@@ -761,15 +840,8 @@
 
   // ---------- svg export ----------
   function buildSVG(){
-    var type = shapeSelect.value;
-    var spacingPx = parseFloat(spacing.value);
-    var scalePct = parseFloat(shapeScale.value) / 100;
-    var size = (spacingPx * scalePct) / 2;
-    var opts = {
-      starPoints: parseInt(starPoints.value, 10),
-      starSpike: parseFloat(starSpike.value),
-      ringThickness: parseFloat(ringThickness.value)
-    };
+    var p = readParams();
+    var size = (p.spacingPx * p.scalePct) / 2;
     var color = selectedColor;
 
     var parts = [];
@@ -779,13 +851,13 @@
     for (var i = 0; i < currentShapes.length; i++){
       var cx = currentShapes[i][0];
       var cy = currentShapes[i][1];
-      var geo = getShapeGeometry(type, cx, cy, size, opts);
+      var geo = getShapeGeometry(p.type, cx, cy, size, p.opts);
       if (geo.kind === 'circle'){
         parts.push('<circle cx="' + round2(geo.cx) + '" cy="' + round2(geo.cy) + '" r="' + round2(geo.r) + '"/>');
       } else if (geo.kind === 'ring'){
         parts.push('<path fill-rule="evenodd" d="' + ringPathData(geo) + '"/>');
       } else {
-        var pts = geo.points.map(function(p){ return round2(p[0]) + ',' + round2(p[1]); }).join(' ');
+        var pts = geo.points.map(function(pt){ return round2(pt[0]) + ',' + round2(pt[1]); }).join(' ');
         parts.push('<polygon points="' + pts + '"/>');
       }
     }
@@ -876,19 +948,19 @@
 
     selectedColor = btn.getAttribute('data-color');
     updateStagePreview();
-
-    if (!hasImage) return;
-    var type = shapeSelect.value;
-    var spacingPx = parseFloat(spacing.value);
-    var scalePct = parseFloat(shapeScale.value) / 100;
-    var size = (spacingPx * scalePct) / 2;
-    var opts = {
-      starPoints: parseInt(starPoints.value, 10),
-      starSpike: parseFloat(starSpike.value),
-      ringThickness: parseFloat(ringThickness.value)
-    };
-    renderCanvas(type, size, opts);
+    redrawOnly();
   });
+
+  // ---------- zoom ----------
+  function setZoom(value){
+    value = Math.max(25, Math.min(400, value));
+    zoomSlider.value = value;
+    zoomVal.textContent = Math.round(value) + '%';
+    redrawOnly();
+  }
+  zoomSlider.addEventListener('input', function(){ setZoom(parseFloat(zoomSlider.value)); });
+  zoomOutBtn.addEventListener('click', function(){ setZoom(parseFloat(zoomSlider.value) - 25); });
+  zoomInBtn.addEventListener('click', function(){ setZoom(parseFloat(zoomSlider.value) + 25); });
 
 })();
 </script>
